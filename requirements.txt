@@ -1,0 +1,11 @@
+# requirements.txt
+streamlit
+pypsa
+xarray
+pandas
+numpy
+folium
+streamlit-folium>=0.8.0
+reportlab
+netcdf4
+plotly==5.22.0
