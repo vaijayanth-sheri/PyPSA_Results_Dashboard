@@ -35,10 +35,14 @@ def render_overview_tab(network: pypsa.Network):
     with col3:
         st.metric("Number of Snapshots", kpis.get('num_snapshots', 'N/A'))
         st.metric("Total Generation", f"{kpis.get('total_annual_generation_mwh', 0):,.0f} MWh" if kpis.get('total_annual_generation_mwh', 0) > 0 else "N/A")
-        total_cost = kpis.get('total_system_cost', 'N/A')
-        st.metric("Total System Cost", f"{total_cost:,.0f}" if isinstance(total_cost, (int, float)) and not pd.isna(total_cost) else "N/A")
+        total_cost_display = f"{kpis.get('total_system_cost', 'N/A'):,.0f}" if isinstance(kpis.get('total_system_cost', 0), (int, float)) and not pd.isna(kpis.get('total_system_cost', 0)) else "N/A"
+        st.metric("Total System Cost", total_cost_display)
+        if kpis.get('system_cost_was_negative', False):
+            st.warning("Note: Total System Cost was negative in the source file and has been displayed as 0 for consistency.")
+
 
     st.subheader("Load vs. Generation Curve")
+    st.info("Note: For overview plots, cumulative time-series data is converted to instantaneous values using `.diff().fillna(0)` and then clipped at zero for display consistency.")
     if kpis.get('num_snapshots', 0) == 0:
         st.warning(NO_SNAPSHOTS_WARNING)
     else:
@@ -46,8 +50,8 @@ def render_overview_tab(network: pypsa.Network):
         generators_t_p = get_pypsa_component_dfs(network, "Generator", time_series=True, target_attribute='p')
 
         if not loads_t_p.empty and not generators_t_p.empty:
-            instantaneous_load = loads_t_p.diff().fillna(0).sum(axis=1)
-            instantaneous_generation = generators_t_p.diff().fillna(0).sum(axis=1)
+            instantaneous_load = loads_t_p.diff().fillna(0).sum(axis=1).clip(lower=0)
+            instantaneous_generation = generators_t_p.diff().fillna(0).sum(axis=1).clip(lower=0)
 
             df_plot = pd.DataFrame({
                 'Load': instantaneous_load,
@@ -66,6 +70,7 @@ def render_overview_tab(network: pypsa.Network):
                 st.warning("One of Load or Generation data is missing, so cannot plot Load vs. Generation.")
 
     st.subheader("Generation by Carrier (Stacked Area)")
+    st.info("Note: For overview plots, cumulative time-series data is converted to instantaneous values using `.diff().fillna(0)` and then clipped at zero for display consistency.")
     if kpis.get('num_snapshots', 0) == 0:
         st.warning(NO_SNAPSHOTS_WARNING)
     else:
@@ -78,7 +83,7 @@ def render_overview_tab(network: pypsa.Network):
             filtered_generators_static = generators_static_df[generators_static_df.index.isin(existing_generators_in_ts)]
 
             if not filtered_generators_static.empty and 'carrier' in filtered_generators_static.columns:
-                instantaneous_generators_t_p = generators_t_p_all.diff().fillna(0)
+                instantaneous_generators_t_p = generators_t_p_all.diff().fillna(0).clip(lower=0)
                 
                 carrier_map = filtered_generators_static.carrier[filtered_generators_static.index.isin(instantaneous_generators_t_p.columns)]
                 
@@ -88,9 +93,6 @@ def render_overview_tab(network: pypsa.Network):
 
                 gen_by_carrier = instantaneous_generators_t_p.groupby(carrier_map, axis=1).sum()
                 
-                # --- FIX: Filter out carriers that are entirely zero across all time steps ---
-                # This ensures that Plotly doesn't draw outlines for non-contributing carriers.
-                # Only keep columns where the sum of absolute values is greater than a small epsilon
                 carriers_to_plot = gen_by_carrier.columns[gen_by_carrier.abs().sum() > 1e-6]
                 
                 gen_by_carrier_active = gen_by_carrier[carriers_to_plot]

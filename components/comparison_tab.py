@@ -8,7 +8,20 @@ import plotly.express as px
 import io
 
 from .data_loader import render_comparison_file_uploader
-from .utils import _get_network_kpis, get_pypsa_component_dfs, _get_available_ts_variables_for_network
+from .utils import _get_network_kpis, get_pypsa_component_dfs, _get_available_ts_variables_for_network, _calculate_carrier_marginal_costs
+
+
+# Helper to check if a Series is likely cumulative (predominantly non-decreasing, non-negative)
+def is_likely_cumulative(series: pd.Series) -> bool:
+    if series.empty:
+        return False
+    if (series < 0).sum() / len(series) > 0.1: # More than 10% negative values? Unlikely cumulative.
+        return False
+    diffs = series.diff().dropna()
+    if diffs.empty:
+        return False
+    return (diffs >= 0).sum() / len(diffs) > 0.9 # More than 90% non-decreasing? Likely cumulative.
+
 
 def render_comparison_tab():
     """
@@ -36,6 +49,11 @@ def render_comparison_tab():
                     st.write(f"Generators: {kpis_comp.get('num_generators', 'N/A')}")
                     st.write(f"Snapshots: {kpis_comp.get('num_snapshots', 'N/A')}")
                     st.write(f"Total Gen Capacity: {kpis_comp.get('total_p_nom_generators', 0):,.0f} MW")
+                    total_cost_display = f"{kpis_comp.get('total_system_cost', 'N/A'):,.0f}" if isinstance(kpis_comp.get('total_system_cost', 0), (int, float)) and not pd.isna(kpis_comp.get('total_system_cost', 0)) else "N/A"
+                    st.write(f"Total System Cost: {total_cost_display}")
+                    if kpis_comp.get('system_cost_was_negative', False):
+                        st.warning("Note: Cost was negative and clipped to 0.")
+                    
                     if st.button(f"Unload {filename}", key=f"unload_{filename}"):
                         del st.session_state.comparison_networks[filename]
                         st.experimental_rerun()
@@ -58,17 +76,41 @@ def render_comparison_tab():
             kpi_df = pd.DataFrame(kpi_data, index=comparison_kpis.keys()).T
             st.dataframe(kpi_df.style.format("{:,.0f}", na_rep="N/A"))
 
-            st.subheader("Delta Visualizations")
-            cost_series = kpi_df.loc['Total System Cost']
-            if not cost_series.isnull().all() and len(cost_series) > 1:
-                base_cost = cost_series.iloc[0]
-                delta_costs = (cost_series - base_cost)
-                fig_delta = px.bar(delta_costs, title='Delta Total System Cost (vs. First Scenario)', labels={"value": 'Cost Difference'})
-                st.plotly_chart(fig_delta, use_container_width=True)
+            # --- FIX: Replace Delta Visualizations with Cost Breakdown ---
+            st.subheader("Total System Cost Breakdown by Carrier")
+            st.info("This plot shows the total marginal cost per generator carrier for each network. Investment costs or other objective components are not included in this breakdown.")
+            
+            cost_breakdown_data = []
+            for net_name, net_obj in comparison_networks.items():
+                if net_obj:
+                    # Use a hash of the network object for caching _calculate_carrier_marginal_costs
+                    net_hash_for_cost = pd.util.hash_pandas_object(net_obj.buses, index=True).sum() # Consistent hashing for network
+                    carrier_costs = _calculate_carrier_marginal_costs(net_hash_for_cost, net_obj)
+                    if not carrier_costs.empty:
+                        for carrier, cost in carrier_costs.items():
+                            cost_breakdown_data.append({
+                                'Network': net_name,
+                                'Carrier': carrier,
+                                'Marginal Cost': cost
+                            })
+            
+            if cost_breakdown_data:
+                df_cost_breakdown = pd.DataFrame(cost_breakdown_data)
+                
+                fig_cost_breakdown = px.bar(df_cost_breakdown, x="Network", y="Marginal Cost", color="Carrier",
+                                            title="Generator Marginal Cost Breakdown by Carrier",
+                                            labels={"Marginal Cost": "Total Marginal Cost"})
+                st.plotly_chart(fig_cost_breakdown, use_container_width=True)
+            else:
+                st.info("No generator marginal cost data available for breakdown from the loaded networks.")
+            # --- END FIX ---
+
 
             st.markdown("---")
             st.subheader("Plot Comparison")
             st.write("Generate custom time-series plots for comparing networks.")
+            st.info("Note: For comparison plots, cumulative time-series data is converted to instantaneous values using `.diff().fillna(0)` and then clipped at zero for display consistency.")
+
 
             selected_networks_for_plot = st.multiselect(
                 "Select Networks to Plot",
@@ -84,7 +126,6 @@ def render_comparison_tab():
             for net_name in selected_networks_for_plot:
                 net_obj = comparison_networks[net_name]
                 if net_obj:
-                    # No need for hash, just pass network directly to discovery func
                     components_for_net = _get_available_ts_variables_for_network(net_obj)
                     for comp_type, vars_list in components_for_net.items():
                         if comp_type not in all_available_components:
@@ -101,11 +142,11 @@ def render_comparison_tab():
             with c1_plot:
                 selected_comp_plot = st.selectbox("1. Select Component Type", options=common_component_types, key="comp_plot_compare")
             with c2_plot:
-                common_vars_for_comp = sorted(list(all_available_components.get(selected_comp_plot, [])))
-                if not common_vars_for_comp:
+                var_options = sorted(list(all_available_components.get(selected_comp_plot, [])))
+                if not var_options:
                     st.warning(f"No common time-series variables for {selected_comp_plot} across selected networks.")
                     return
-                selected_var_plot = st.selectbox("2. Select Variable", options=common_vars_for_comp, key="var_plot_compare")
+                selected_var_plot = st.selectbox("2. Select Variable", options=var_options, key="var_plot_compare")
             
             agg_options = ["Per Component", "Total Sum"]
             has_carrier_info = False
@@ -153,7 +194,10 @@ def render_comparison_tab():
                             continue
                         
                         df_instantaneous = df_raw_for_net.diff().fillna(0)
-                        
+                        if selected_var_plot in ['p']:
+                             df_instantaneous = df_instantaneous.clip(lower=0)
+
+
                         if selected_subset_plot:
                             df_instantaneous = df_instantaneous[[col for col in selected_subset_plot if col in df_instantaneous.columns]]
                             if df_instantaneous.empty:
@@ -207,7 +251,6 @@ def render_comparison_tab():
                         st.warning("Combined data is empty or all NaN after processing. Cannot generate plot.")
                         return
 
-                    # --- FIX: Removed hover_name argument ---
                     if selected_agg_plot == "Group by Carrier":
                         fig_comp = px.area(combined_df, title=f"Comparison of {selected_var_plot} ({selected_agg_plot}) by Carrier",
                                            labels={"value": f"Power ({selected_var_plot})", "index": "Time"})

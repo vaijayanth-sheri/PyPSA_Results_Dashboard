@@ -3,7 +3,8 @@
 import pypsa
 import pandas as pd
 import numpy as np
-# Removed streamlit import as no more debugging prints in this file
+import streamlit as st
+
 
 def _get_network_kpis(network: pypsa.Network) -> dict:
     """Calculates a set of KPIs for the network based only on data present in the file."""
@@ -21,12 +22,22 @@ def _get_network_kpis(network: pypsa.Network) -> dict:
     total_generation = 0
     generators_t_p = get_pypsa_component_dfs(network, "Generator", time_series=True, target_attribute='p')
     if generators_t_p is not None and not generators_t_p.empty:
-        instantaneous_generation = generators_t_p.diff().fillna(0) # Apply diff for KPIs
+        instantaneous_generation = generators_t_p.diff().fillna(0).clip(lower=0)
         total_generation = instantaneous_generation.sum().sum()
 
     kpis['total_annual_generation_mwh'] = total_generation
     
-    kpis['total_system_cost'] = network.objective if hasattr(network, 'objective') else np.nan
+    raw_system_cost = network.objective if hasattr(network, 'objective') else np.nan
+    
+    kpis['system_cost_was_negative'] = False
+    if isinstance(raw_system_cost, (int, float)) and not pd.isna(raw_system_cost):
+        if raw_system_cost < 0:
+            kpis['system_cost_was_negative'] = True
+            kpis['total_system_cost'] = 0 # Clip negative costs to 0 for display
+        else:
+            kpis['total_system_cost'] = raw_system_cost
+    else:
+        kpis['total_system_cost'] = np.nan # Keep as NaN if not a valid number
 
     return kpis
 
@@ -34,11 +45,6 @@ def _get_network_kpis(network: pypsa.Network) -> dict:
 def get_pypsa_component_dfs(network: pypsa.Network, component_type: str, time_series: bool = True, target_attribute: str = None) -> pd.DataFrame:
     """
     Retrieves the DataFrame for a given PyPSA component type.
-    This function handles how PyPSA stores DataFrames within its component objects
-    and ensures it always returns a standard pandas.DataFrame.
-    
-    If `target_attribute` is provided (e.g., 'p', 'state_of_charge'), it tries to return
-    that specific time-series DataFrame directly.
     """
     component_to_attribute_map = {
         "Generator": "generators",
@@ -59,7 +65,7 @@ def get_pypsa_component_dfs(network: pypsa.Network, component_type: str, time_se
     if pypsa_obj is None:
         return pd.DataFrame()
 
-    df = pd.DataFrame() # Initialize an empty DataFrame
+    df = pd.DataFrame()
     
     if time_series:
         if target_attribute:
@@ -71,10 +77,10 @@ def get_pypsa_component_dfs(network: pypsa.Network, component_type: str, time_se
                     df = pd.DataFrame(attr_df) if attr_df is not None else pd.DataFrame()
                 except Exception:
                     df = pd.DataFrame()
-        else: # For discovery, without a specific target_attribute, try common ones
+        else:
             if hasattr(pypsa_obj, 'p') and isinstance(pypsa_obj.p, pd.DataFrame):
                 df = pypsa_obj.p
-            elif hasattr(pypsa_obj, 'df') and isinstance(pypsa_obj.df, pd.DataFrame): # Fallback some objects use .df
+            elif hasattr(pypsa_obj, 'df') and isinstance(pypsa_obj.df, pd.DataFrame):
                 df = pypsa_obj.df
             else:
                 try:
@@ -82,7 +88,7 @@ def get_pypsa_component_dfs(network: pypsa.Network, component_type: str, time_se
                 except Exception:
                     df = pd.DataFrame()
 
-    else: # Static components
+    else:
         if isinstance(pypsa_obj, pd.DataFrame):
             df = pypsa_obj
         else:
@@ -91,7 +97,6 @@ def get_pypsa_component_dfs(network: pypsa.Network, component_type: str, time_se
             except Exception:
                 df = pd.DataFrame()
 
-    # Final validation for time-series data:
     if time_series and not df.empty:
         if not isinstance(df.index, pd.DatetimeIndex):
             return pd.DataFrame()
@@ -102,10 +107,11 @@ def get_pypsa_component_dfs(network: pypsa.Network, component_type: str, time_se
 
     return df
 
-def _get_available_ts_variables_for_network(network: pypsa.Network) -> dict:
+
+@st.cache_data
+def _get_available_ts_variables_for_network(_network: pypsa.Network) -> dict: # <--- FIX: Changed network to _network
     """
     Introspects a single network to find components with time-series data and their variables.
-    Returns a dictionary mapping component names to a list of their variables.
     """
     available = {}
     component_names = ["Generator", "Load", "Line", "StorageUnit", "Bus"]
@@ -113,11 +119,11 @@ def _get_available_ts_variables_for_network(network: pypsa.Network) -> dict:
 
     for comp in component_names:
         found_variables = []
-        pypsa_t_obj = getattr(network, f"{comp.lower()}s_t", None)
+        pypsa_t_obj = getattr(_network, f"{comp.lower()}s_t", None) # <--- Use _network
         
         if pypsa_t_obj is not None:
             for var in common_ts_variables:
-                df_for_var = get_pypsa_component_dfs(network, comp, time_series=True, target_attribute=var)
+                df_for_var = get_pypsa_component_dfs(_network, comp, time_series=True, target_attribute=var) # <--- Use _network
                 
                 if not df_for_var.empty and isinstance(df_for_var.index, pd.DatetimeIndex):
                     found_variables.append(var)
@@ -126,3 +132,31 @@ def _get_available_ts_variables_for_network(network: pypsa.Network) -> dict:
             available[comp] = sorted(list(set(found_variables)))
 
     return available
+
+@st.cache_data
+def _calculate_carrier_marginal_costs(_network_hash: str, _network: pypsa.Network) -> pd.Series:
+    """
+    Calculates the total marginal cost for each generator carrier in a network.
+    Assumes generators_t.p is already instantaneous power (or converted via diff).
+    """
+    marginal_costs_series = pd.Series(dtype=float)
+    if not _network.generators.empty and 'carrier' in _network.generators.columns and \
+       'marginal_cost' in _network.generators.columns:
+        
+        generators_t_p = get_pypsa_component_dfs(_network, "Generator", time_series=True, target_attribute='p')
+        if generators_t_p.empty:
+            return pd.Series(dtype=float)
+
+        instantaneous_generators_t_p = generators_t_p.diff().fillna(0).clip(lower=0)
+
+        generating_generators = instantaneous_generators_t_p.columns[instantaneous_generators_t_p.abs().sum() > 1e-6]
+        
+        if not generating_generators.empty:
+            generator_info = _network.generators.loc[generating_generators, ['carrier', 'marginal_cost']]
+            
+            costs_per_generator_t = instantaneous_generators_t_p[generating_generators] * generator_info['marginal_cost']
+            
+            marginal_costs_series = costs_per_generator_t.groupby(generator_info['carrier'], axis=1).sum().sum()
+            marginal_costs_series = marginal_costs_series.clip(lower=0)
+
+    return marginal_costs_series

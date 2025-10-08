@@ -6,37 +6,33 @@ import pandas as pd
 import plotly.express as px
 import io
 
-from .utils import get_pypsa_component_dfs
+from .utils import get_pypsa_component_dfs, _get_available_ts_variables_for_network
 from .constants import NO_SNAPSHOTS_WARNING
+
+# Helper to check if a Series is likely cumulative (predominantly non-decreasing, non-negative)
+def is_likely_cumulative(series: pd.Series) -> bool:
+    if series.empty:
+        return False
+    if (series < 0).sum() / len(series) > 0.1:
+        return False
+    diffs = series.diff().dropna()
+    if diffs.empty:
+        return False
+    return (diffs >= 0).sum() / len(diffs) > 0.9
+
 
 @st.cache_data
 def discover_timeseries_components(_network_hash: str, _network: pypsa.Network) -> dict:
     """
     Introspects the network to find components with time-series data and their variables.
     """
-    available = {}
-    component_names = ["Generator", "Load", "Line", "StorageUnit", "Bus"]
-    common_ts_variables = ['p', 'q', 'state_of_charge', 'p0', 'p1', 'marginal_price']
+    # This calls _get_available_ts_variables_for_network from utils.py
+    return _get_available_ts_variables_for_network(_network)
 
-    for comp in component_names:
-        found_variables = []
-        pypsa_t_obj = getattr(_network, f"{comp.lower()}s_t", None)
-        
-        if pypsa_t_obj is not None:
-            for var in common_ts_variables:
-                df_for_var = get_pypsa_component_dfs(_network, comp, time_series=True, target_attribute=var)
-                
-                if not df_for_var.empty and isinstance(df_for_var.index, pd.DatetimeIndex):
-                    found_variables.append(var)
-        
-        if found_variables:
-            available[comp] = sorted(list(set(found_variables)))
-
-    return available
 
 @st.cache_data
 def process_and_plot_data(_network_hash: str, _network: pypsa.Network, component_type: str, variable: str,
-                          subset: tuple, aggregation: str, frequency: str):
+                          subset: tuple, aggregation: str, frequency: str, apply_diff: bool):
     """
     The core function to fetch, transform, and plot the data.
     """
@@ -48,18 +44,16 @@ def process_and_plot_data(_network_hash: str, _network: pypsa.Network, component
     if df_raw_for_plot.empty:
         return None, None, f"Time-series data for variable '{variable}' not found or is empty for component '{component_type}'."
 
-    # --- FIX: Apply .diff() to convert cumulative data to instantaneous values for plotting ---
-    # Only apply if the data type seems to be cumulative (e.g., non-negative and has first non-zero)
-    # A simple heuristic: if values are strictly non-decreasing and start positive, apply diff.
-    # This might need refinement based on exact data characteristics.
-    if (df_raw_for_plot >= 0).all().all() and (df_raw_for_plot.iloc[0] > 0).any(): # Heuristic for cumulative
-        df = df_raw_for_plot.diff().fillna(0)
-    else:
-        df = df_raw_for_plot # Use raw data if not cumulative
+    df = df_raw_for_plot.copy()
+
+    if apply_diff:
+        df = df.diff().fillna(0)
     
-    # Check if the data is all zeros after diff/processing
+    # In Plots & Metrics, we let user decide if .diff() is applied.
+    # We generally don't clip here as negative values (e.g., storage discharge)
+    # might be valid raw data that the user wants to inspect.
     if df.sum().sum() == 0 and df.shape[1] > 0:
-         return pd.DataFrame(), None, "Data seems to be all zeros or constant after processing. Check source data."
+         return pd.DataFrame(), None, "Data seems to be all zeros or constant. Check source data or 'Apply .diff()' option."
 
 
     if subset:
@@ -81,7 +75,7 @@ def process_and_plot_data(_network_hash: str, _network: pypsa.Network, component
         static_df = get_pypsa_component_dfs(_network, component_type, time_series=False)
         if 'carrier' not in static_df.columns:
             return None, None, f"Cannot group by carrier: '{component_type}' components do not have a 'carrier' attribute."
-
+        
         carrier_map = static_df['carrier']
         filtered_carrier_map = carrier_map[carrier_map.index.isin(df.columns)]
 
@@ -91,12 +85,7 @@ def process_and_plot_data(_network_hash: str, _network: pypsa.Network, component
         plot_df = df.groupby(filtered_carrier_map, axis=1).sum()
         plot_title = f"Sum of {variable} by Carrier"
 
-        # --- FIX: Filter out carriers that are entirely zero across all time steps ---
-        # This ensures that Plotly doesn't draw outlines for non-contributing carriers.
-        # Only keep columns where the sum of absolute values is greater than a small epsilon
         carriers_to_plot = plot_df.columns[plot_df.abs().sum() > 1e-6]
-
-        # Apply this filter to plot_df before generating the figure
         plot_df = plot_df[carriers_to_plot]
 
     if frequency != "Original":
@@ -163,13 +152,24 @@ def render_plots_metrics_tab(network: pypsa.Network):
     
     selected_freq = st.selectbox("5. Select Time Resolution", options=["Original", "Hourly", "Daily", "Monthly"])
 
+    # --- New Toggle for .diff() ---
+    apply_diff_option = False
+    # Only offer this option for power/flow-like variables which might be cumulative
+    if selected_var in ['p', 'q', 'p0', 'p1']:
+        st.info("Raw data for power/flow variables may be cumulative. Use the toggle below for instantaneous values.")
+        apply_diff_option = st.checkbox("Apply `.diff().fillna(0)` for instantaneous values", value=True,
+                                        help="Converts cumulative power/flow data to instantaneous values per time interval. Disable if your data is already instantaneous or represents state values (e.g., SOC).")
+    else:
+        st.info("`.diff()` option not typically applicable to this variable type (e.g., marginal_price, SOC) and is disabled.")
+
+
     st.markdown("---")
     with st.spinner("Processing data and generating plot..."):
         subset_tuple = tuple(sorted(selected_subset))
 
         final_df, fig, error_message = process_and_plot_data(
             network_hash, network, selected_comp, selected_var,
-            subset_tuple, selected_agg, selected_freq
+            subset_tuple, selected_agg, selected_freq, apply_diff_option # Pass new argument
         )
 
         if error_message:
